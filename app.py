@@ -3,16 +3,22 @@
 import io
 import json
 import os
+import time
 from typing import List, Optional
 
 import streamlit as st
 from docx import Document
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 DEFAULT_MODEL = "gemini-flash-latest"  # alias to the newest Flash model
+# Tried in order if the chosen model stays overloaded or is unavailable.
+FALLBACK_MODELS = ["gemini-flash-lite-latest", "gemini-2.5-flash"]
+RETRYABLE_CODES = {429, 500, 502, 503, 504}  # temporary errors worth retrying
+MAX_RETRIES = 3  # attempts per model
+RETRY_BASE_DELAY = 2  # seconds; doubles after each failed attempt
 MAX_RESUME_CHARS = 30_000
 MAX_FILE_MB = 5
 
@@ -103,13 +109,11 @@ RESUME:
 """
 
 
-def analyze_resume(
-    api_key: str, model: str, resume_text: str, job_description: str
-) -> ResumeAnalysis:
-    client = genai.Client(api_key=api_key)
+def _generate(client, model: str, prompt: str) -> ResumeAnalysis:
+    """One Gemini request, returned as a validated ResumeAnalysis."""
     response = client.models.generate_content(
         model=model,
-        contents=build_prompt(resume_text, job_description),
+        contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=ResumeAnalysis,
@@ -125,6 +129,45 @@ def analyze_resume(
         text = text.strip("`")
         text = text.split("\n", 1)[1] if "\n" in text else text
     return ResumeAnalysis.model_validate(json.loads(text))
+
+
+def analyze_resume(
+    api_key: str, model: str, resume_text: str, job_description: str
+) -> ResumeAnalysis:
+    """Analyze a resume, retrying temporary errors and falling back to other models."""
+    client = genai.Client(api_key=api_key)
+    prompt = build_prompt(resume_text, job_description)
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
+
+    last_exc: Optional[Exception] = None
+    for name in models:
+        for attempt in range(MAX_RETRIES):
+            try:
+                return _generate(client, name, prompt)
+            except errors.APIError as exc:
+                last_exc = exc
+                if exc.code == 404:  # model name not available: try the next one
+                    break
+                if exc.code not in RETRYABLE_CODES:
+                    raise  # e.g. bad API key (400/403): retrying will not help
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_BASE_DELAY * 2**attempt)
+    assert last_exc is not None
+    raise last_exc
+
+
+def friendly_error(exc: Exception) -> str:
+    code = getattr(exc, "code", None)
+    if code in (429, 503):
+        return (
+            "Gemini is busy or you hit the rate limit. The app already retried and "
+            "tried backup models. Please wait a minute and click Analyze again."
+        )
+    if code in (400, 401, 403):
+        return "Gemini rejected the request. Check that your API key is valid."
+    if code == 404:
+        return "That Gemini model name was not found. Try 'gemini-flash-latest'."
+    return f"Analysis failed: {exc}"
 
 
 # ---------------------------------- UI -------------------------------------
@@ -259,7 +302,7 @@ def main() -> None:
                 )
         except Exception as exc:
             st.session_state.pop("result", None)
-            st.error(f"Analysis failed: {exc}")
+            st.error(friendly_error(exc))
             return
 
     if "result" in st.session_state:
